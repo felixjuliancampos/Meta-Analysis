@@ -1,0 +1,193 @@
+##############################################################################
+#Análisis Bayesiano para Suicidio y Semaglutida
+
+
+
+# Install required packages
+install.packages(c("openxlsx", "brms"))
+
+# Load libraries
+library(openxlsx)
+library(brms)
+
+# Read data
+Datos <- read.xlsx("SemaglutidaSuicidio.xlsx")
+
+# Reshape data to long format
+Datos_long <- data.frame(
+  Author = rep(Datos$Author, each = 2),
+  group  = rep(c("Intervention", "Control"), times = nrow(Datos)),
+  events = c(Datos$event.e, Datos$event.c),
+  time   = c(Datos$time.e, Datos$time.c)
+)
+
+# Create treatment indicator
+Datos_long$treat <- ifelse(Datos_long$group == "Intervention", 1, 0)
+
+# Define priors
+priors <- c(
+  brms::prior(normal(0, 1), class = "Intercept"),
+  brms::prior(normal(0, 1), class = "b"),
+  brms::prior(cauchy(0, 0.5), class = "sd")
+)
+
+# Bayesian Poisson meta-regression with random study effects
+m.bmrs <- brm(
+  events ~ treat + offset(log(time)) + (1 | Author),
+  data = Datos_long,
+  family = poisson(),
+  prior = priors,
+  chains = 4,
+  iter = 4000,
+  warmup = 1000,
+  control = list(adapt_delta = 0.95)
+)
+
+# Model summary
+summary(m.bmrs)
+
+# Posterior predictive checks
+pp_check(m.bmrs)
+
+# Extract Incidence Rate Ratio (IRR)
+posterior <- posterior_samples(m.bmrs)
+IRR <- exp(posterior$b_treat)
+
+# IRR summary
+quantile(IRR, probs = c(0.025, 0.5, 0.975))
+
+### Fixing Divergence
+
+priors <- c(
+  brms::prior(normal(0, 1), class = "Intercept"),
+  brms::prior(normal(0, 1), class = "b"),
+  brms::prior(exponential(1), class = "sd")  # stronger regularization
+)
+
+m.bmrs2 <- brm(
+  events ~ treat + offset(log(time)) + (1 | Author),
+  data = Datos_long,
+  family = poisson(),
+  prior = priors,
+  chains = 4,
+  iter = 6000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15)
+)
+
+summary(m.bmrs2)
+
+############Forest Plot
+
+events ~ treat + offset(log(time)) + (1 | Author)
+
+library(brms)
+library(dplyr)
+library(tidyr)
+
+# Extract posterior samples
+post <- posterior_samples(m.bmrs)
+
+# Extract population-level treatment effect
+post$treat_IRR <- exp(post$b_treat)
+
+# Extract study-specific treatment effects
+ranef_author <- ranef(m.bmrs)$Author[, , "Intercept"]
+
+# Combine population + random intercept
+study_IRR <- lapply(1:nrow(ranef_author), function(i) {
+  exp(post$b_treat + ranef_author[i, "Estimate"])
+})
+
+# Summarize posterior per study
+forest_data <- data.frame(
+  Author = rownames(ranef_author),
+  IRR = sapply(study_IRR, median),
+  lower = sapply(study_IRR, quantile, 0.025),
+  upper = sapply(study_IRR, quantile, 0.975)
+)
+
+# Add pooled effect
+pooled <- data.frame(
+  Author = "Overall",
+  IRR = median(post$treat_IRR),
+  lower = quantile(post$treat_IRR, 0.025),
+  upper = quantile(post$treat_IRR, 0.975)
+)
+
+forest_data <- bind_rows(forest_data, pooled)
+
+library(ggplot2)
+
+forest_data$Author <- factor(
+  forest_data$Author,
+  levels = forest_data$Author
+)
+
+ggplot(forest_data, aes(x = IRR, y = Author)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_log10() +
+  labs(
+    x = "Incidence Rate Ratio (log scale)",
+    y = "",
+    title = "Bayesian Forest Plot of Semaglutide vs Control",
+    subtitle = "Posterior medians and 95% credible intervals"
+  ) +
+  theme_minimal(base_size = 14)
+
+forest_data$P_IRR_gt1 <- c(
+  sapply(study_IRR, function(x) mean(x > 1)),
+  mean(post$treat_IRR > 1)
+)
+
+####posterior predictive forest plot approach
+
+library(brms)
+library(tidyverse)
+
+# Extract posterior draws
+post <- posterior_samples(m.bmrs)
+
+# Extract random effects names
+ranef_names <- grep("^r_Author\\[", colnames(post), value = TRUE)
+
+# Create study-level posterior effects
+study_effects <- lapply(ranef_names, function(r) {
+  tibble(
+    Author = gsub("r_Author\\[|,Intercept\\]", "", r),
+    logIRR = post$b_treat + post[[r]]
+  )
+}) %>% bind_rows()
+
+forest_data <- study_effects %>%
+  group_by(Author) %>%
+  summarise(
+    IRR = exp(median(logIRR)),
+    lCrI = exp(quantile(logIRR, 0.025)),
+    uCrI = exp(quantile(logIRR, 0.975))
+  )
+
+pooled <- tibble(
+  Author = "Overall (pooled)",
+  IRR = exp(median(post$b_treat)),
+  lCrI = exp(quantile(post$b_treat, 0.025)),
+  uCrI = exp(quantile(post$b_treat, 0.975))
+)
+
+forest_data <- bind_rows(forest_data, pooled)
+
+ggplot(forest_data, aes(x = IRR, y = reorder(Author, IRR))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = lCrI, xmax = uCrI), height = 0.2) +
+  scale_x_log10() +
+  labs(
+    x = "Incidence Rate Ratio (log scale)",
+    y = "",
+    title = "Posterior Predictive Forest Plot",
+    subtitle = "Bayesian Poisson Random-Effects Meta-Regression"
+  ) +
+  theme_minimal(base_size = 12)
+
