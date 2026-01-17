@@ -1,0 +1,239 @@
+###############################################################################
+# Frequentist vs Bayesian Meta-analysis of Semaglutide and Suicidal Outcomes
+#
+# Author: Félix Julián Campos García
+# Description:
+#   This script reproduces the frequentist (DerSimonian–Laird / Mantel–Haenszel)
+#   and Bayesian hierarchical meta-analyses evaluating the association between
+#   semaglutide use in obesity and suicidal outcomes.
+#
+# Data requirements:
+#   An Excel file named "SemaglutidaSuicidio2025.xlsx" with the following columns:
+#     - author   : Study identifier
+#     - event.e  : Events in experimental group
+#     - n.e      : Total in experimental group
+#     - event.c  : Events in control group
+#     - n.c      : Total in control group
+#
+# Reproducibility:
+#   - Bayesian model fitted using brms (Stan backend)
+#   - Random seed set for reproducibility
+#
+# Citation:
+#   Please cite this repository if you use or adapt this code.
+###############################################################################
+
+############################
+# 1. Load required packages
+############################
+
+# NOTE: Install packages manually if not already installed.
+library(openxlsx)
+library(tidyverse)
+library(meta)
+library(dmetar)
+library(brms)
+library(readxl)
+library(tidybayes)
+library(ggplot2)
+library(ggridges)
+library(glue)
+library(stringr)
+library(forcats)
+library(posterior)
+library(bayesplot)
+
+############################
+# 2. Read data
+############################
+
+data_path <- "SemaglutidaSuicidio2025.xlsx"
+
+suicide_data <- read.xlsx(data_path)
+
+############################
+# 3. Frequentist meta-analysis
+#    Mantel–Haenszel (fixed and random effects)
+############################
+
+m.freq <- metabin(
+  event.e = event.e,
+  n.e     = n.e,
+  event.c = event.c,
+  n.c     = n.c,
+  studlab = author,
+  data    = suicide_data,
+  sm      = "RR",
+  method  = "MH",
+  MH.exact = TRUE,
+  fixed   = TRUE,
+  random  = TRUE,
+  method.tau = "PM",
+  method.random.ci = "HK",
+  title   = "Semaglutide and Suicidal Outcomes"
+)
+
+summary(m.freq)
+
+# Forest plot
+forest(m.freq)
+
+############################
+# 4. Funnel plot (publication bias)
+############################
+
+meta::funnel(
+  m.freq,
+  xlim = c(0.03, 25),
+  studlab = TRUE
+)
+
+title("Funnel Plot: Semaglutide and Suicidal Outcomes")
+
+############################
+# 5. Bayesian meta-analysis
+#    Hierarchical binomial model (log link, RR scale)
+############################
+
+# Prepare long-format data
+datos_long <- suicide_data %>%
+  mutate(study = author) %>%
+  pivot_longer(
+    cols = c(event.e, event.c, n.e, n.c),
+    names_to = c(".value", "group"),
+    names_pattern = "(event|n)\\.(e|c)"
+  ) %>%
+  mutate(
+    treat = ifelse(group == "e", 1, 0),
+    non_events = n - event
+  )
+
+# Priors
+priors <- c(
+  prior(normal(0, 1.5), class = "Intercept"),
+  prior(normal(0, 1), class = "b"),
+  prior(exponential(1), class = "sd")
+)
+
+set.seed(1234)
+
+m.bayes.RR <- brm(
+  event | trials(n) ~ treat + (1 | study),
+  data   = datos_long,
+  family = binomial(link = "log"),
+  prior  = priors,
+  chains = 4,
+  iter   = 6000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15)
+)
+
+############################
+# 6. Bayesian model diagnostics
+############################
+
+summary(m.bayes.RR)
+
+# Posterior predictive check
+pp_check(m.bayes.RR)
+
+############################
+# 7. Bayesian forest plot
+#    Study-specific posterior distributions
+############################
+
+# Study-specific effects
+study_draws <- spread_draws(
+  m.bayes.RR, r_study[study,], b_treat
+) %>%
+  mutate(logRR = b_treat + r_study)
+
+# Pooled effect
+pooled_draws <- spread_draws(m.bayes.RR, b_treat) %>%
+  mutate(
+    study = "Pooled Effect",
+    logRR = b_treat
+  )
+
+forest_data <- bind_rows(study_draws, pooled_draws) %>%
+  ungroup() %>%
+  mutate(
+    study = str_replace_all(study, "[.]", " "),
+    RR = exp(logRR)
+  )
+
+forest_summary <- forest_data %>%
+  group_by(study) %>%
+  mean_qi(RR)
+
+# Extract pooled estimates
+pooled_fixef <- fixef(m.bayes.RR)["treat", ]
+pooled_RR  <- exp(pooled_fixef[1])
+pooled_l95 <- exp(pooled_fixef[3])
+pooled_u95 <- exp(pooled_fixef[4])
+
+# Order studies
+study_order <- forest_summary %>%
+  arrange(study != "Pooled Effect", study) %>%
+  pull(study)
+
+forest_data <- forest_data %>%
+  mutate(study = factor(study, levels = study_order))
+
+forest_summary <- forest_summary %>%
+  mutate(study = factor(study, levels = study_order))
+
+# Plot
+ggplot(forest_data, aes(x = RR, y = study)) +
+  geom_vline(xintercept = 1, colour = "black", linewidth = 0.4) +
+  geom_vline(xintercept = pooled_RR,
+             colour = "grey40",
+             linewidth = 0.4,
+             linetype = "dashed") +
+  geom_vline(xintercept = c(pooled_l95, pooled_u95),
+             colour = "grey40",
+             linetype = 2) +
+  geom_density_ridges(
+    fill = "steelblue",
+    alpha = 0.8,
+    rel_min_height = 0.01,
+    scale = 0.8,
+    colour = NA
+  ) +
+  geom_point(data = forest_summary, aes(x = RR), size = 2) +
+  geom_errorbarh(
+    data = forest_summary,
+    aes(xmin = .lower, xmax = .upper),
+    height = 0.2,
+    linewidth = 0.8
+  ) +
+  geom_text(
+    data = mutate_if(forest_summary, is.numeric, round, 2),
+    aes(label = glue("{RR} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward",
+    size = 3.5
+  ) +
+  scale_x_log10(
+    limits = c(1e-5, 10),
+    expand = expansion(mult = c(0.02, 0.15))
+  ) +
+  labs(
+    x = "Risk Ratio (log scale)",
+    y = NULL,
+    title = "Bayesian Meta-analysis of Semaglutide and Suicidal Outcomes"
+  ) +
+  theme_minimal(base_size = 12)
+
+############################
+# 8. Trace plots and autocorrelation
+############################
+
+draws <- as_draws_df(m.bayes.RR)
+
+# Trace plots
+mcmc_trace(draws, pars = "b_treat")
+mcmc_trace(draws, pars = "sd_study__Intercept")
+
+# Autocorrelation plots
+mcmc_acf(draws, pars = "b_treat")
+mcmc_acf(draws, pars = "sd_study__Intercept")
